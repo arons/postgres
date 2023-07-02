@@ -53,6 +53,145 @@ static Oid	LookupFuncNameInternal(ObjectType objtype, List *funcname,
 								   bool include_out_arguments, bool missing_ok,
 								   FuncLookupError *lookupError);
 
+bool
+is_type_ok(Oid inputTypeId, Oid targetTypeId)
+{
+	CoercionPathType pathtype;
+	Oid			funcId;
+
+	/* no problem if same type */
+	if (inputTypeId == targetTypeId){
+		return true;
+	}
+
+	/* accept if target is ANY */
+	if (targetTypeId == ANYOID){
+		return true;
+	}
+
+	/* accept if target is polymorphic, for now */
+	if (IsPolymorphicType(targetTypeId))
+	{
+		return true;
+	}
+
+	/*
+	 * If input is an untyped string constant, assume we can convert it to
+	 * anything.
+	 */
+	if (inputTypeId == UNKNOWNOID)
+		return true;
+
+	/*
+	 * If pg_cast shows that we can coerce, accept.  This test now covers
+	 * both binary-compatible and coercion-function cases.
+	 */
+	pathtype = find_coercion_pathway(targetTypeId, inputTypeId, COERCION_IMPLICIT,
+									 &funcId);
+	if (pathtype != COERCION_PATH_NONE)
+		return true;
+	/*
+	 * If input is RECORD and target is a composite type, assume we can
+	 * coerce (may need tighter checking here)
+	 */
+	if (inputTypeId == RECORDOID &&
+		ISCOMPLEX(targetTypeId))
+		return true;
+
+	/*
+	 * If input is a composite type and target is RECORD, accept
+	 */
+	if (targetTypeId == RECORDOID &&
+		ISCOMPLEX(inputTypeId))
+		return true;
+
+	/*
+	 * If input is a class type that inherits from target, accept
+	 */
+	if (typeInheritsFrom(inputTypeId, targetTypeId)
+		//|| typeIsOfTypedTable(inputTypeId, targetTypeId)
+       )
+		return true;
+
+	/*
+	 * Else, cannot coerce at this argument position
+	 */
+	return false;
+}
+
+/*
+ * 
+ */
+const char *
+error_func_get_detail(List *funcname,
+				List *fargs,
+				List *fargnames,
+				int nargs,
+				Oid *argtypes,
+				bool expand_variadic,
+				bool expand_defaults,
+				bool include_out_arguments,
+				Oid *funcid,	/* return value */
+				Oid *rettype,	/* return value */
+				bool *retset,	/* return value */
+				int *nvargs,	/* return value */
+				Oid *vatype,	/* return value */
+				Oid **true_typeids, /* return value */
+				List **argdefaults) /* optional return value */
+{
+	FuncCandidateList raw_candidates;
+	FuncCandidateList current_candidate;
+	StringInfoData argbuf;
+	int i=0;
+	/* Get list of possible candidates from namespace search */
+	raw_candidates = FuncnameGetCandidates(funcname, nargs, fargnames,
+										   expand_variadic, expand_defaults,
+										   include_out_arguments, false);
+
+	initStringInfo(&argbuf);
+	appendStringInfo(&argbuf,"\n");
+	//appendStringInfo(&argbuf,"requested: \n%s\n", func_signature_string(funcname, nargs, fargnames, argtypes));
+	appendStringInfo(&argbuf, "candidates: \n");
+
+	for (current_candidate = raw_candidates;
+		 current_candidate != NULL;
+		 current_candidate = current_candidate->next)
+	{
+		HeapTuple	tup;
+
+		tup = SearchSysCache1(PROCOID, ObjectIdGetDatum(current_candidate->oid));
+		if (HeapTupleIsValid(tup)) {
+			Form_pg_proc procForm = (Form_pg_proc) GETSTRUCT(tup);
+			const char* functionName = NameStr(procForm->proname);
+			appendStringInfo(&argbuf, "%s(", functionName);
+		}
+		ReleaseSysCache(tup);
+
+
+		for (i = 0; i < current_candidate->nargs; i++)
+		{
+			if (i) {
+				appendStringInfoString(&argbuf, ", ");
+			}
+
+			char * name_of_type = format_type_be(current_candidate->args[i]);
+			if( ! is_type_ok(argtypes[i], current_candidate->args[i])){
+				int j = 0;
+				while(name_of_type[j]) {
+				  name_of_type[j] = toupper(name_of_type[j]);
+				  j++;
+				}
+			}
+
+			appendStringInfoString(&argbuf, name_of_type);
+		}
+		appendStringInfo(&argbuf, ")\n");
+	}
+
+
+	appendStringInfo(&argbuf, "\n");
+	return argbuf.data;
+}
 
 /*
  *	Parse a function call
@@ -616,24 +755,40 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 							 "after all regular arguments of the aggregate."),
 					 parser_errposition(pstate, location)));
 		}
-		else if (proc_call)
+		else if (proc_call){
+			const char *fmt = error_func_get_detail(funcname, fargs, argnames, nargs,
+													actual_arg_types,
+													!func_variadic, true, proc_call,
+													&funcid, &rettype, &retset,
+													&nvargs, &vatype,
+													&declared_arg_types, &argdefaults);
+			
 			ereport(ERROR,
 					(errcode(ERRCODE_UNDEFINED_FUNCTION),
 					 errmsg("procedure %s does not exist",
 							func_signature_string(funcname, nargs, argnames,
 												  actual_arg_types)),
-					 errhint("No procedure matches the given name and argument types. "
-							 "You might need to add explicit type casts."),
+					 errhint("No procedure matches the given name and argument types.%s"
+							 "You might need to add explicit type casts.", fmt),
 					 parser_errposition(pstate, location)));
-		else
+		}
+		else{
+			const char *fmt = error_func_get_detail(funcname, fargs, argnames, nargs,
+													actual_arg_types,
+													!func_variadic, true, proc_call,
+													&funcid, &rettype, &retset,
+													&nvargs, &vatype,
+													&declared_arg_types, &argdefaults);
+
 			ereport(ERROR,
 					(errcode(ERRCODE_UNDEFINED_FUNCTION),
 					 errmsg("function %s does not exist",
 							func_signature_string(funcname, nargs, argnames,
 												  actual_arg_types)),
-					 errhint("No function matches the given name and argument types. "
-							 "You might need to add explicit type casts."),
+					 errhint("No function matches the given name and argument types.%s"
+							 "You might need to add explicit type casts.", fmt),
 					 parser_errposition(pstate, location)));
+		}
 	}
 
 	/*
