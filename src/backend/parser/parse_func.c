@@ -119,6 +119,37 @@ is_type_ok(Oid inputTypeId, Oid targetTypeId)
 	return false;
 }
 
+static void
+append_func_signature(StringInfo buf, List *funcname, Oid *argtypes, int nargs)
+{
+	ListCell *lc;
+	bool first = true;
+
+	/* Append function name (possibly schema-qualified) */
+	foreach(lc, funcname)
+	{
+		if (!first)
+			appendStringInfoChar(buf, '.');
+		appendStringInfoString(buf, strVal(lfirst(lc)));
+		first = false;
+	}
+
+	appendStringInfoChar(buf, '(');
+
+	for (int i = 0; i < nargs; i++)
+	{
+		if (i > 0)
+			appendStringInfoString(buf, ", ");
+
+		/* Get the type name from the OID */
+		char *typename = format_type_be(argtypes[i]);
+		appendStringInfoString(buf, typename);
+	}
+
+	appendStringInfoChar(buf, ')');
+}
+
+
 /*
  * 
  */
@@ -149,6 +180,8 @@ error_func_get_detail(List *funcname,
 										   include_out_arguments, false);
 
 	initStringInfo(&argbuf);
+	appendStringInfo(&argbuf,"\n");
+	append_func_signature(&argbuf, funcname, argtypes, nargs);
 	appendStringInfo(&argbuf,"\n");
 	//appendStringInfo(&argbuf,"requested: \n%s\n", func_signature_string(funcname, nargs, fargnames, argtypes));
 	appendStringInfo(&argbuf, "candidates: \n");
